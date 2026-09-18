@@ -1,0 +1,147 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    restart: always
+    environment:
+      POSTGRES_USER: power
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      POSTGRES_DB: power
+      # 针对 3.5G 小内存调优，避免 PG 默认配置吃光内存
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_connections=60
+      - -c
+      - wal_compression=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U power -d power"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # 刻意不声明 ports：数据库仅在同一 compose 网络内可达，绝不暴露公网
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *default-logging
+
+  mqtt:
+    image: emqx/emqx:5.8
+    restart: always
+    environment:
+      EMQX_ALLOW_ANONYMOUS: "true"
+      EMQX_NODE__NAME: "emqx@127.0.0.1"
+      EMQX_DASHBOARD__DEFAULT_PASSWORD: ${EMQX_PASSWORD:?EMQX_PASSWORD is required}
+    volumes:
+      - emqxdata:/opt/emqx/data
+    healthcheck:
+      test: ["CMD", "emqx", "ctl", "status"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    logging: *default-logging
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    env_file: .env
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: power
+      DB_NAME: power
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      MQTT_HOST: mqtt
+      MQTT_PORT: "1883"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      # 只监听回环地址：公网访问一律经 Nginx，避免绕过 HTTPS 直连后端
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    logging: *default-logging
+
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    command: ["python", "-m", "app.consumer"]
+    env_file: .env
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: power
+      DB_NAME: power
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      MQTT_HOST: mqtt
+      MQTT_PORT: "1883"
+    depends_on:
+      db:
+        condition: service_healthy
+      mqtt:
+        condition: service_healthy
+    logging: *default-logging
+
+  simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    command: ["python", "-m", "simulator.breaker_sim", "--devices", "10", "--interval", "5"]
+    environment:
+      MQTT_HOST: mqtt
+      MQTT_PORT: "1883"
+    depends_on:
+      mqtt:
+        condition: service_healthy
+    logging: *default-logging
+
+volumes:
+  pgdata:
+  redisdata:
+  emqxdata:

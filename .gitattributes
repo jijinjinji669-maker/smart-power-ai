@@ -1,0 +1,24 @@
+# 统一行尾策略：避免 Windows 的 CRLF 传到 Linux 后脚本无法执行
+# 报错形式：/bin/bash^M: bad interpreter
+
+# 默认：让 git 自动判断，文本文件入库统一用 LF
+* text=auto eol=lf
+
+# 明确指定：这些必须在 Linux 上执行，强制 LF
+*.sh      text eol=lf
+Dockerfile text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.conf    text eol=lf
+*.sql     text eol=lf
+*.py      text eol=lf
+*.md      text eol=lf
+
+# 二进制文件不做行尾转换
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.pdf     binary
+*.zip     binary
+*.gz      binary

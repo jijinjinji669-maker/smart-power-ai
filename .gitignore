@@ -1,0 +1,29 @@
+# ---- 机密 ----
+.env
+*.pem
+*.key
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+_libs/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 运行时产物 ----
+*.log
+logs/
+data/
+pgdata/
+redisdata/
+emqxdata/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
