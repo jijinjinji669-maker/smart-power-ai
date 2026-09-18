@@ -65,6 +65,7 @@ docker compose logs -f consumer
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/api/stats/summary
 open http://127.0.0.1:8000/docs          # Swagger 文档
+open http://127.0.0.1:8501               # 可视化看板
 ```
 
 ### 服务器部署
@@ -76,6 +77,35 @@ cp .env.example .env
 vim .env                                  # 填强密码
 chmod +x deploy.sh
 ./deploy.sh
+```
+
+---
+
+## 可视化看板
+
+Streamlit 看板（容器名 `dashboard`，监听 `127.0.0.1:8501`），三个视图：
+
+| 视图 | 内容 |
+|---|---|
+| 📊 实时监控 | 多设备电流趋势（分钟聚合）、==告警点叠加在曲线上==、漏电曲线（含 30mA 安全线）、温度曲线（含 55℃ 告警线）、各设备最新读数 |
+| 🔔 告警中心 | 按类型分布柱状图、按小时告警趋势、可按类型/状态过滤的告警明细（含**判定理由**） |
+| 📋 设备台账 | 每台设备的健康状态、累计读数、漏电峰值、温度峰值、最近上报时间 |
+
+看板特性：
+
+- **直连数据库**读取分钟聚合视图 `readings_1min`，不扫原始表
+- 时间窗口 1h ~ 72h 可调，自动刷新 0/5/10/30/60 秒可调
+- 与 API 一样只监听回环地址，公网访问经 Nginx 反代（配置见 `nginx/smart-power.conf`）
+
+```bash
+# 只看板单独重启
+docker compose restart dashboard
+
+# 看板日志
+docker compose logs -f dashboard
+
+# 本机验证（服务器上执行）
+curl -s http://127.0.0.1:8501/_stcore/health
 ```
 
 ---
