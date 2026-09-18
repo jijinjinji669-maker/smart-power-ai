@@ -1,12 +1,17 @@
 services:
   db:
-    image: timescale/timescaledb:latest-pg16
+    # 不用 timescale/timescaledb 官方镜像：约 500MB，国内加速器多无缓存，
+    # 会回落直连 Docker Hub 导致下载龟速甚至中断（本项目实测卡在这一步）。
+    # 改为基于 postgres:16（约 140MB，各加速器均有缓存）本地构建，
+    # TimescaleDB 扩展通过 apt 安装。详见 db/Dockerfile。
+    build:
+      context: ./db
+      dockerfile: Dockerfile
     restart: always
     environment:
       POSTGRES_USER: power
       POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
       POSTGRES_DB: power
-      # 针对 3.5G 小内存调优，避免 PG 默认配置吃光内存
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -25,6 +30,11 @@ services:
       - max_connections=60
       - -c
       - wal_compression=on
+      # shared_preload_libraries 不在这里设置：
+      # postgres 官方 entrypoint 会用 initdb 重新生成 postgresql.conf，
+      # -c 传入的参数在 initdb 阶段不生效。扩展的预加载配置放在
+      # db/Dockerfile 写好的 /etc/postgresql/conf.d/10-timescaledb.conf 里，
+      # 由镜像 entrypoint 自动 include_dir 加载。
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U power -d power"]
       interval: 10s
