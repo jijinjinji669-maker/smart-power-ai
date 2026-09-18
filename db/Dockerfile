@@ -30,20 +30,33 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
-# 关键一步：让 TimescaleDB 被 preload，否则
-# CREATE EXTENSION timescaledb 会报 FATAL: extension "timescaledb" must be preloaded
+# 关键一步：让 TimescaleDB 被 preload。
+# 少了这一步，init.sql 里的 CREATE EXTENSION timescaledb 会直接失败：
+#     FATAL: extension "timescaledb" must be preloaded
+# 而且是致命错误 —— 它会让整个 init.sql 中断，后续所有建表都不执行。
 #
 # 原理：官方 postgres 镜像的 entrypoint 用 initdb 初始化数据目录，
-# initdb 会把 /usr/share/postgresql/16/postgresql.conf.sample 复制成
-# $PGDATA/postgresql.conf。所以必须改这份「模板文件」——改完之后，
-# 无论首次 initdb 的临时实例，还是之后启动的正式实例，都会带上这个配置。
+# initdb 会把 /usr/share/postgresql/16/postgresql.conf.sample **复制**成
+# $PGDATA/postgresql.conf。所以要改的是这份「模板」，不是数据目录里的那份。
 #
-# 踩过的坑（记录在此，避免重犯）：
-#   ✗ 放 /etc/postgresql/conf.d/ 无效 —— 生成的 postgresql.conf 里没有 include 该目录，
-#     因为我们并没有覆盖 config_file。这个目录只有在你自己提供 postgresql.conf
-#     并 include 它时才生效，官方镜像默认不走这条路。
-#   ✗ 只在 docker-compose 的 command 里加 -c shared_preload_libraries=... 也无效 ——
-#     该参数在 initdb 阶段创建的临时实例上不生效，而 CREATE EXTENSION 正是在那时执行。
+# 为什么这一行就够了：entrypoint 在「跑 init.sql 的临时实例」和
+# 「最终正式实例」上都用同一份 initdb 产物，所以改模板对两者同时生效。
+#
+# ---------------------------------------------------------------------------
+# 踩过的两个坑（都实测无效，记录在此避免重犯）：
+#
+#   ✗ 把配置放 /etc/postgresql/conf.d/ 或 Dockerfile 里 mkdir 一个 conf.d
+#     完全没用。官方镜像的 initdb 生成的 postgresql.conf 里**没有**
+#     include_dir 任何 conf.d 目录。实测日志证据：
+#         "PostgreSQL Database directory appears to contain a database;
+#          Skipping initialization"
+#     然后 CREATE EXTENSION 依旧报 must be preloaded。
+#     只有你自己提供 postgresql.conf 并显式 include 该目录时，conf.d 才有意义。
+#
+#   ✗ 只在 docker-compose 的 command 里加
+#         -c shared_preload_libraries=timescaledb
+#     也不行。因为 CREATE EXTENSION 是在 entrypoint 创建的那个**临时实例**上
+#     执行的，而该实例不受 compose 的 -c 参数影响。
 # ---------------------------------------------------------------------------
 RUN set -eux; \
     CONF=/usr/share/postgresql/16/postgresql.conf.sample; \
@@ -52,4 +65,5 @@ RUN set -eux; \
     else \
         echo "shared_preload_libraries = 'timescaledb'" >> "$CONF"; \
     fi; \
+    echo "--- 确认写入结果 ---"; \
     grep -n "shared_preload_libraries" "$CONF"
