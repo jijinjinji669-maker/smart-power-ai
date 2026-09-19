@@ -1,7 +1,7 @@
 services:
   db:
     # 不用 timescale/timescaledb 官方镜像：约 500MB，国内加速器多无缓存，
-    # 会回落直连 Docker Hub 导致下载龟速甚至中断（本项目实测卡在这一步）。
+    # 会回落直连 Docker Hub 导致下载龟速甚至中断（本项目在阿里云 ECS 上实测卡死在这一步）。
     # 改为基于 postgres:16（约 140MB，各加速器均有缓存）本地构建，
     # TimescaleDB 扩展通过 apt 安装。详见 db/Dockerfile。
     build:
@@ -12,6 +12,7 @@ services:
       POSTGRES_USER: power
       POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
       POSTGRES_DB: power
+      # 针对 3.5G 小内存调优，避免 PG 默认配置吃光内存
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -32,9 +33,8 @@ services:
       - wal_compression=on
       # shared_preload_libraries 不在这里设置：
       # postgres 官方 entrypoint 会用 initdb 重新生成 postgresql.conf，
-      # -c 传入的参数在 initdb 阶段不生效。扩展的预加载配置放在
-      # db/Dockerfile 写好的 /etc/postgresql/conf.d/10-timescaledb.conf 里，
-      # 由镜像 entrypoint 自动 include_dir 加载。
+      # -c 传入的参数在 initdb 阶段不生效。扩展的预加载配置写在
+      # db/Dockerfile 中的 postgresql.conf.sample 里。
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U power -d power"]
       interval: 10s
@@ -136,13 +136,13 @@ services:
       mqtt:
         condition: service_healthy
     healthcheck:
-      # 不能省略 healthcheck：Dockerfile 里的 HEALTHCHECK 是给 api 服务检查 8000 端口的，
+      # 不能省略这一段：Dockerfile 里的 HEALTHCHECK 是给 api 探活 8000 端口的，
       # 而 consumer 与 api 共用同一镜像，会继承那条探针，
       # 然后因为不监听 8000 端口而永远显示 unhealthy —— 探针问错了问题。
       #
-      # 这里换成真实的业务健康检查：consumer 每成功入库一批就刷新 Redis 里的
+      # 这里换成业务级健康检查：consumer 每成功入库一批就刷新 Redis 里的
       # heartbeat:consumer 时间戳，探针判断该时间戳是否在 180 秒内。
-      # 检查的是"最近真的处理过数据吗"，能发现"进程活着但消费停滞"这种真故障。
+      # 检查的是"最近真的处理过数据吗"，因此"进程活着但消费停滞"也会被标记出来。
       test: ["CMD", "python", "-m", "app.healthcheck", "--service", "consumer", "--max-age", "180"]
       interval: 30s
       timeout: 10s
@@ -165,7 +165,7 @@ services:
       db:
         condition: service_healthy
     ports:
-      # 只监听回环地址：公网访问一律经 Nginx 反代（配置见 nginx/smart-power.conf）。
+      # 只监听回环地址，公网访问经 Nginx 反代（配置见 nginx/smart-power.conf）。
       # 调试期如需直接用 IP 访问，可临时改成 "8501:8501" 并在安全组放行 8501，
       # 但 Streamlit 本身没有鉴权，看完务必改回来。
       - "127.0.0.1:8501:8501"
@@ -190,9 +190,9 @@ services:
       mqtt:
         condition: service_healthy
     healthcheck:
-      # 显式关闭：simulator 同样继承 api 镜像的 8000 端口探针。
+      # 显式关闭：simulator 同样会继承 api 镜像的 8000 端口探针。
       # 它是数据源（不是被监控对象），也刻意不依赖 Redis，
-      # 所以这里直接关掉，避免无意义的 unhealthy 状态。
+      # 所以直接关掉，避免无意义的 unhealthy 状态。
       disable: true
     logging: *default-logging
 
