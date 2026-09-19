@@ -135,6 +135,19 @@ services:
         condition: service_healthy
       mqtt:
         condition: service_healthy
+    healthcheck:
+      # 不能省略 healthcheck：Dockerfile 里的 HEALTHCHECK 是给 api 服务检查 8000 端口的，
+      # 而 consumer 与 api 共用同一镜像，会继承那条探针，
+      # 然后因为不监听 8000 端口而永远显示 unhealthy —— 探针问错了问题。
+      #
+      # 这里换成真实的业务健康检查：consumer 每成功入库一批就刷新 Redis 里的
+      # heartbeat:consumer 时间戳，探针判断该时间戳是否在 180 秒内。
+      # 检查的是"最近真的处理过数据吗"，能发现"进程活着但消费停滞"这种真故障。
+      test: ["CMD", "python", "-m", "app.healthcheck", "--service", "consumer", "--max-age", "180"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
     logging: *default-logging
 
   dashboard:
@@ -152,7 +165,9 @@ services:
       db:
         condition: service_healthy
     ports:
-      # 与 api 一致：只监听回环，公网访问一律经 Nginx
+      # 只监听回环地址：公网访问一律经 Nginx 反代（配置见 nginx/smart-power.conf）。
+      # 调试期如需直接用 IP 访问，可临时改成 "8501:8501" 并在安全组放行 8501，
+      # 但 Streamlit 本身没有鉴权，看完务必改回来。
       - "127.0.0.1:8501:8501"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=5).status==200 else 1)"]
@@ -174,6 +189,11 @@ services:
     depends_on:
       mqtt:
         condition: service_healthy
+    healthcheck:
+      # 显式关闭：simulator 同样继承 api 镜像的 8000 端口探针。
+      # 它是数据源（不是被监控对象），也刻意不依赖 Redis，
+      # 所以这里直接关掉，避免无意义的 unhealthy 状态。
+      disable: true
     logging: *default-logging
 
 volumes:

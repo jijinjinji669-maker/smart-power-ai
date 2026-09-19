@@ -12,6 +12,7 @@ import json
 import logging
 import signal
 import sys
+import time
 from datetime import datetime
 from typing import Any
 
@@ -23,6 +24,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.config import get_settings
 from app.db import SessionLocal, engine
 from app.detector import AnomalyDetector, DetectParams
+
+# 心跳 key：与 app/healthcheck.py 中的命名保持一致，否则探针会永远判定不健康
+HEARTBEAT_KEY = "heartbeat:consumer"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -191,6 +195,9 @@ class IngestPipeline:
                     key = f"latest:{r['device_id']}"
                     pipe.hset(key, mapping={k: str(v) for k, v in r.items() if k != "device_id"})
                     pipe.expire(key, 3600)
+                # 心跳：每成功入库一批就刷新时间戳，
+                # 供 app.healthcheck 判断"消费是否停滞"，而不是只判断"进程是否活着"
+                pipe.set(HEARTBEAT_KEY, str(time.time()), ex=600)
                 await pipe.execute()
             except Exception:
                 log.warning("Redis 更新失败（不影响入库）")
