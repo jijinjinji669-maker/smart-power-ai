@@ -32,6 +32,19 @@ DB_URL = (
 SEVERITY_LABEL = {1: "提示", 2: "警告", 3: "紧急"}
 SEVERITY_COLOR = {1: "#f59e0b", 2: "#f97316", 3: "#ef4444"}
 
+# LLM 诊断走 API 而不是直连数据库 —— 诊断逻辑在服务端，
+# 而且这个接口要花钱，必须由服务端统一控制。
+API_BASE = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+
+# 异常区间在曲线上的底色（按类型区分，便于一眼分辨）
+KIND_FILL = {
+    "过载": "rgba(239,68,68,0.13)",
+    "漏电": "rgba(168,85,247,0.15)",
+    "欠压": "rgba(59,130,246,0.13)",
+    "过压": "rgba(234,179,8,0.13)",
+    "过温": "rgba(249,115,22,0.13)",
+}
+
 
 @st.cache_resource
 def get_engine():
@@ -42,6 +55,143 @@ def get_engine():
 def query(sql: str, **params) -> pd.DataFrame:
     with get_engine().connect() as conn:
         return pd.read_sql(text(sql), conn, params=params)
+
+
+# ---------------------------------------------------------------------------
+# 与后端 API 的交互
+# ---------------------------------------------------------------------------
+def api_get(path: str, timeout: float = 20.0) -> dict | None:
+    """调用后端 GET 接口。失败返回 None 并提示，不抛异常中断看板。"""
+    import httpx
+
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.get(f"{API_BASE}{path}")
+        if resp.status_code == 200:
+            return resp.json()
+        st.warning(f"接口返回 {resp.status_code}：{resp.text[:200]}")
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"调用后端失败（{API_BASE}）：{exc}")
+    return None
+
+
+def api_post(path: str, payload: dict, timeout: float = 90.0) -> dict | None:
+    """调用后端 POST 接口。诊断要调 LLM，超时给得宽一些。"""
+    import httpx
+
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(f"{API_BASE}{path}", json=payload)
+        if resp.status_code == 200:
+            return resp.json()
+        st.error(f"接口返回 {resp.status_code}：{resp.text[:300]}")
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"调用后端失败（{API_BASE}）：{exc}")
+    return None
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_llm_status() -> dict:
+    """LLM 配置状态。缓存 30 秒，不必每次刷新都问。"""
+    import httpx
+
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(f"{API_BASE}/api/llm/status")
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:  # noqa: BLE001
+        pass
+    return {"configured": False, "target": "未知", "note": "后端不可达"}
+
+
+def render_diagnosis(result: dict) -> None:
+    """把诊断结果渲染成结构化 UI。"""
+    analysis = result.get("analysis")
+    intervals = result.get("intervals") or []
+
+    # ---- 本地识别结果（无论 LLM 成功与否都有）----
+    if intervals:
+        st.markdown("**本地识别到的异常区间**")
+        for i, iv in enumerate(intervals, 1):
+            sig = iv.get("suggested_signature") or {}
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([2, 2, 3])
+                c1.markdown(f"**{i}. {iv.get('kind_label', '异常')}**")
+                c1.caption(f"{iv.get('start_time', '')} → "
+                           f"{iv.get('end_time', '')}（{iv.get('duration_text', '')}）")
+                c2.markdown(f"规则匹配：**{sig.get('label', '—')}**")
+                if "current" in iv:
+                    c = iv["current"]
+                    c2.caption(f"电流 {c.get('peak')}A "
+                               f"= {c.get('peak_multiple_of_rated')}× 额定")
+                if "leakage" in iv:
+                    lk = iv["leakage"]
+                    c2.caption(f"漏电峰值 {lk.get('peak_ma')}mA"
+                               f"（基线 {lk.get('baseline_before_event_ma')}mA）")
+                if "voltage" in iv:
+                    v = iv["voltage"]
+                    c2.caption(f"电压最低 {v.get('min')}V"
+                               f"（偏差 {v.get('min_deviation_percent')}%）")
+                c3.caption(f"形态：{(iv.get('current') or {}).get('shape', '—')}")
+                if iv.get("within_normal_range"):
+                    c3.caption(f"段内正常：{', '.join(iv['within_normal_range'])}")
+
+    # ---- LLM 未成功 ----
+    if not result.get("ok"):
+        err = result.get("error") or "未知原因"
+        if "未配置" in err:
+            st.info(err)
+        elif "没有识别到异常区间" in err:
+            st.info(err)
+        else:
+            st.error(f"分析失败：{err}")
+        for p in result.get("validation_problems") or []:
+            st.caption(f"⚠️ {p}")
+        return
+
+    # ---- LLM 结论 ----
+    a = analysis or {}
+    st.markdown("---")
+    st.markdown("### 🤖 LLM 成因分析")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("判定成因", a.get("cause_label", "—"))
+    m2.metric("置信度", f"{(a.get('confidence') or 0) * 100:.0f}%")
+    m3.metric("严重程度", a.get("severity", "—"))
+
+    if a.get("is_normal_phenomenon"):
+        st.success("✅ 模型判断这是**正常现象**，不是故障 —— 不应触发告警")
+
+    if a.get("reasoning"):
+        st.markdown("**判断依据**")
+        st.markdown(a["reasoning"])
+
+    ca, cb = st.columns(2)
+    with ca:
+        if a.get("evidence"):
+            st.markdown("**引用证据**")
+            for e in a["evidence"]:
+                st.markdown(f"- {e}")
+    with cb:
+        if a.get("actions"):
+            st.markdown("**处置建议**")
+            for i, act in enumerate(a["actions"], 1):
+                st.markdown(f"{i}. {act}")
+
+    if a.get("uncertainties"):
+        st.markdown("**模型指出的不确定项**")
+        for u in a["uncertainties"]:
+            st.caption(f"• {u}")
+
+    llm = result.get("llm") or {}
+    st.caption(
+        f"模型 {llm.get('model', '—')} · 耗时 {llm.get('latency_ms', 0)}ms · "
+        f"tokens {llm.get('prompt_tokens', 0)}+{llm.get('completion_tokens', 0)} · "
+        f"分析于 {result.get('analyzed_at', '')}"
+    )
+    for p in result.get("validation_problems") or []:
+        st.caption(f"⚠️ 输出校验：{p}")
 
 
 # ============================ 侧边栏 ============================
@@ -119,6 +269,20 @@ if page == "📊 实时监控":
         ids=picked,
     )
 
+    # ---------- 先取异常区间（曲线要在图上标出这些区间，所以必须先拿到）----------
+    # 序列号 -> 区间列表。纯本地计算，不调 LLM。
+    anomalies_by_sn: dict[str, list[dict]] = {}
+    sn_by_id: dict[int, str] = {}
+    for row in devices.itertuples():
+        sn_by_id[row.id] = row.device_sn
+    for did in picked:
+        sn = sn_by_id.get(did)
+        if not sn:
+            continue
+        anom = api_get(f"/api/devices/{sn}/anomalies?minutes={hours * 60}")
+        if anom:
+            anomalies_by_sn[sn] = anom.get("intervals") or []
+
     st.subheader(f"电流趋势（最近 {hours} 小时 · 分钟均值）")
     if curve.empty:
         st.info("这个时间窗口内还没有聚合数据。连续聚合视图每分钟刷新一次，稍等即可。")
@@ -134,6 +298,38 @@ if page == "📊 实时监控":
                     name=label_map[did], line=dict(width=1.8),
                 )
             )
+
+        # ---- 异常区间底色标注：一眼看出"哪一段出了问题、是什么类型" ----
+        # 注意时区：后端返回的是本地时间字符串，需要转成 tz-aware 才能和
+        # 数据库读出的 tz-aware 时间戳对齐，否则矩形会画到 8 小时之外。
+        tz = curve["bucket"].dt.tz
+        marked = 0
+        for sn, intervals in anomalies_by_sn.items():
+            for iv in intervals:
+                try:
+                    x0 = pd.to_datetime(iv["start_time"])
+                    x1 = pd.to_datetime(iv["end_time"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if x0.tzinfo is None and tz is not None:
+                    x0, x1 = x0.tz_localize(tz), x1.tz_localize(tz)
+                # 单点区间太窄，视觉上撑开一点，否则看不见
+                if x1 <= x0:
+                    x1 = x0 + pd.Timedelta(minutes=1)
+
+                kind = (iv.get("kinds") or ["异常"])[0]
+                fig.add_vrect(
+                    x0=x0, x1=x1,
+                    fillcolor=KIND_FILL.get(kind, "rgba(148,163,184,0.13)"),
+                    line_width=0, layer="below",
+                    annotation_text=iv.get("kind_label", kind),
+                    annotation_position="top left",
+                    annotation_font_size=10,
+                )
+                marked += 1
+        if marked:
+            st.caption(f"曲线底色标出了 {marked} 个异常区间；"
+                       f"下方「异常区间标注」可查看细节并手动触发 LLM 成因分析")
 
         # 把告警点叠加在曲线之上 —— 一眼看出"哪台设备、什么时刻出的问题"
         alerts = query(
@@ -166,6 +362,109 @@ if page == "📊 实时监控":
             hovermode="x unified",
         )
         st.plotly_chart(fig, use_container_width=True)
+
+    # ================== 异常区间自动标注 + LLM 手动分析 ==================
+    st.divider()
+    st.subheader("🔍 异常区间标注")
+
+    llm_status = load_llm_status()
+    if not llm_status.get("configured"):
+        st.caption(f"LLM 未配置（{llm_status.get('target')}）—— "
+                   f"仍可查看异常区间，{llm_status.get('note', '')}")
+
+    # 每台选中设备各算一次区间。这是纯本地计算，不花钱，所以可以随看板刷新。
+    # 区间数据在上面画曲线底色时已经取过，这里直接复用，不重复调 API。
+    total_intervals = 0
+    for did in picked:
+        sn = sn_by_id.get(did)
+        if not sn:
+            continue
+        intervals = anomalies_by_sn.get(sn) or []
+        total_intervals += len(intervals)
+        if not intervals:
+            continue
+
+        st.markdown(f"**{label_map.get(did, sn)}** —— 识别到 {len(intervals)} 段异常")
+
+        for idx, iv in enumerate(intervals, 1):
+            sig = iv.get("suggested_signature") or {}
+            with st.expander(
+                f"{idx}. {iv.get('kind_label', '异常')} · "
+                f"{iv.get('start_time', '')[11:16]} → {iv.get('end_time', '')[11:16]} · "
+                f"{iv.get('duration_text', '')} · 规则匹配：{sig.get('label', '—')}",
+                expanded=False,
+            ):
+                d1, d2, d3 = st.columns(3)
+                if "current" in iv:
+                    c = iv["current"]
+                    d1.metric("电流峰值", f"{c.get('peak')} A",
+                              f"{c.get('peak_multiple_of_rated')}× 额定")
+                    d1.caption(f"形态 {c.get('shape')}｜"
+                               f"超脱扣边界 {c.get('thermal_trip_a')}A："
+                               f"{'是' if c.get('exceeds_thermal_trip') else '否'}")
+                if "leakage" in iv:
+                    lk = iv["leakage"]
+                    d2.metric("漏电峰值", f"{lk.get('peak_ma')} mA",
+                              f"基线 {lk.get('baseline_before_event_ma')} mA")
+                    d2.caption(f"形态 {lk.get('shape')}｜涨幅 {lk.get('rise_ma')}mA")
+                if "voltage" in iv:
+                    v = iv["voltage"]
+                    d3.metric("电压最低", f"{v.get('min')} V",
+                              f"{v.get('min_deviation_percent')}%")
+                    d3.caption(f"形态 {v.get('shape')}｜"
+                               f"允许下限 {v.get('allowed_min')}V")
+                if "temperature" in iv:
+                    t = iv["temperature"]
+                    d3.metric("温度峰值", f"{t.get('peak_c')} ℃",
+                              f"+{t.get('rise_c')} ℃")
+                if iv.get("within_normal_range"):
+                    st.caption(f"段内保持正常的量：{', '.join(iv['within_normal_range'])}")
+                st.caption(f"事件前基线：电流 "
+                           f"{(iv.get('current') or {}).get('baseline_before_event', '—')}A｜"
+                           f"电压 {(iv.get('voltage') or {}).get('baseline_before_event', '—')}V｜"
+                           f"漏电 {(iv.get('leakage') or {}).get('baseline_before_event_ma', '—')}mA")
+
+                # ---- 手动确认触发 LLM 分析 ----
+                st.markdown("---")
+                cache_key = f"diag::{sn}::{iv.get('start_time')}::{iv.get('end_time')}"
+                cached = st.session_state.get(cache_key)
+
+                btn_col, note_col = st.columns([1, 3])
+                with btn_col:
+                    btn_label = "📖 查看已有分析" if cached else "🤖 分析成因"
+                    clicked = st.button(btn_label, key=f"btn::{cache_key}",
+                                        disabled=not llm_status.get("configured"))
+                with note_col:
+                    if cached:
+                        st.caption("该区间的分析结果已缓存，不会重复调用 API")
+                    else:
+                        st.caption(
+                            "点击后将把**该时段的电气量、设备参数与本地特征**"
+                            "发送给 LLM 分析成因（会产生 API 费用）。"
+                            "不会发送设备位置等敏感信息。"
+                        )
+                    if llm_status.get("configured"):
+                        st.caption(f"目标：{llm_status.get('target')}")
+
+                if not llm_status.get("configured"):
+                    st.info("未配置 LLM_API_KEY，无法进行成因分析。"
+                            "请在服务器 .env 中填写后重启 api 容器。")
+
+                if clicked:
+                    with st.spinner("正在调用 LLM 分析成因，通常需要 5-15 秒…"):
+                        result = api_post(
+                            f"/api/devices/{sn}/diagnose",
+                            {"minutes": hours * 60, "include_alerts": True},
+                        )
+                    if result:
+                        st.session_state[cache_key] = result
+
+                if cached:
+                    render_diagnosis(cached)
+
+    if total_intervals == 0:
+        st.info("所选设备在当前时间窗口内没有识别到异常区间。"
+                "可以调大「数据窗口」，或注入一次故障后回来看。")
 
     # ---------- 漏电与温度 ----------
     col_a, col_b = st.columns(2)

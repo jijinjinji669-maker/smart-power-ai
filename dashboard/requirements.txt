@@ -3,3 +3,5 @@ plotly==5.24.1
 pandas==2.2.3
 SQLAlchemy==2.0.36
 psycopg2-binary==2.9.10
+# 调用后端 API（异常区间标注 / LLM 成因诊断）用
+httpx==0.28.1

@@ -1,0 +1,73 @@
+# 故障场景库：覆盖 simulator/device.py 里 FAULT_PROFILES 的默认值
+#
+# 为什么要这个文件：把「故障长什么样」从代码里拿出来，改数值不用动 Python。
+# 只写你要改的字段即可，没写的沿用代码里的默认值。
+#
+# 参数说明：
+#   peak_multiple    过载=相对额定电流的倍数；电压=跌落比例；漏电=不使用
+#   duration_seconds 事件持续时长区间 [最小, 最大]，单位秒
+#   ramp             形态：stepped 阶梯 / linear 线性 / sudden 突变 / exponential 指数
+#   steps            阶梯级数（ramp=stepped 时有效），每一级对应一台电器投入
+#   cross_fraction   越过阈值的时点，占事件时长的比例区间（漏电用）
+#   reversible_probability  中途回落概率（受潮缓解）
+#   affects_panel    是否影响同配电箱其他设备
+#   is_normal        True = 正常现象，不是故障（不参与故障率统计）
+#   description      人类可读的场景说明，会出现在日志和告警里
+
+# ============ 过载类 ============
+multi_appliance:
+  label: 多台大功率同时开
+  peak_multiple: [1.5, 2.2]
+  duration_seconds: [120, 480]
+  ramp: stepped
+  steps: 3
+  description: 空调 + 电热水器 + 微波炉同时运行，负载逐台投入
+
+socket_overload:
+  label: 插排串接大功率
+  peak_multiple: [1.2, 1.6]
+  duration_seconds: [300, 1800]
+  ramp: linear
+  description: 一个插座带多台设备，缓慢累积到轻微过载
+
+motor_stall:
+  label: 电机堵转
+  peak_multiple: [3.0, 5.0]
+  duration_seconds: [5, 60]
+  ramp: sudden
+  description: 洗衣机或水泵被卡住，电流骤升到接近磁脱扣区
+
+# ============ 漏电类 ============
+damp_creep:
+  label: 线路受潮
+  duration_seconds: [14400, 172800]      # 4 - 48 小时
+  ramp: exponential
+  cross_fraction: [0.70, 0.90]
+  reversible_probability: 0.20
+  description: 雨季或浴室线路受潮，漏电缓慢爬升到 30 mA 红线
+
+insulation_aging:
+  label: 电器绝缘老化
+  duration_seconds: [172800, 2592000]    # 2 - 30 天
+  ramp: linear
+  cross_fraction: [0.80, 0.95]
+  reversible_probability: 0.10
+  description: 老旧电热水器或洗衣机绝缘劣化，数月尺度缓慢上升
+
+# ============ 电压类 ============
+sag_from_load:
+  label: 大功率启动导致电压跌落
+  peak_multiple: [0.15, 0.25]            # 跌落比例，不是电流倍数
+  duration_seconds: [30, 300]
+  ramp: sudden
+  affects_panel: true
+  description: 大功率设备启动，同配电箱内多路电压同时跌落
+
+# ============ 正常现象（用来考验检测器，不计入故障率）============
+compressor_inrush:
+  label: 空调或冰箱压缩机启动浪涌
+  peak_multiple: [5.0, 7.0]
+  duration_seconds: [0.2, 2.0]
+  ramp: sudden
+  is_normal: true
+  description: 压缩机启动瞬间 5-7 倍稳态电流，数百毫秒后回落。正常现象，但极易误报

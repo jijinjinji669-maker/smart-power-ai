@@ -91,13 +91,28 @@ TIERS: dict[str, TierSpec] = {
 class FaultProfile:
     """一个故障场景的形态定义。
 
-    参数全部是**相对额定电流的倍数**，同一套场景可套用到任意档位。
+    ⚠️ 关于 `peak_multiple`：**不同故障类型的基准不同**，这点容易混淆。
+
+      · overload（过载）—— 基准是**额定电流 In**。
+        因为 IEC 60898-1 的脱扣曲线本来就按 In 的倍数定义，
+        这样写才能直接和热脱扣 / 磁脱扣边界比较。
+        例：2.0 表示目标电流 = 2 × In。
+
+      · inrush（启动浪涌）—— 基准是**稳态工作电流**。
+        因为行业资料的表述是「电动机起动电流为满载电流的 500%~700%」，
+        指的是设备自身的工作电流，而非断路器额定值。
+        例：6.0 表示 6 × 该时刻的稳态负荷。
+
+      · voltage（电压跌落）—— `peak_multiple` 表示**跌落比例**，不是倍数。
+        例：0.20 表示电压下降 20%。
+
+      · leakage（漏电）—— 不使用该字段，漏电按 mA 增量建模。
     """
 
     key: str
     label: str
     fault_type: str                                # overload / leakage / voltage / inrush
-    peak_multiple: tuple[float, float]             # 峰值倍数区间（相对 In）
+    peak_multiple: tuple[float, float]             # 含义随 fault_type 变化，见类文档
     duration_seconds: tuple[float, float]          # 持续时长区间
     ramp: str = "stepped"                          # stepped / linear / sudden / exponential
     steps: int = 1                                 # 阶梯级数（ramp=stepped 时有效）

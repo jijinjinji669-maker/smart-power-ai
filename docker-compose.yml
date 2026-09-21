@@ -161,8 +161,13 @@ services:
       DB_USER: power
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
       DB_NAME: power
+      # 异常区间标注与 LLM 诊断走 api 服务，而不是直连数据库：
+      # 诊断逻辑在服务端，且该接口会产生 API 费用，必须由服务端统一控制
+      API_BASE_URL: http://api:8000
     depends_on:
       db:
+        condition: service_healthy
+      api:
         condition: service_healthy
     ports:
       # 只监听回环地址，公网访问经 Nginx 反代（配置见 nginx/smart-power.conf）。
