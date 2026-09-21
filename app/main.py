@@ -290,7 +290,18 @@ def _to_series_points(readings: list[dict]) -> list[SeriesPoint]:
 
 
 def _f(value) -> float | None:
-    return None if value is None else float(value)
+    """把数据库返回的 NUMERIC 转成原生 float。
+
+    注意：asyncpg 对 PostgreSQL 的 NUMERIC 列返回的是 decimal.Decimal，
+    而 Decimal 不能被 json.dumps 序列化 —— 拼 prompt 时会直接抛
+    "Object of type Decimal is not JSON serializable"。所以这里必须显式转 float。
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @app.get("/api/devices/{sn}/anomalies", tags=["诊断"])
@@ -387,7 +398,17 @@ async def device_diagnose(
             )
         ).mappings().all()
         alerts = [
-            {**dict(r), "detected_at": r["detected_at"].isoformat()} for r in rows
+            {
+                "alert_type": r["alert_type"],
+                "severity": int(r["severity"]) if r["severity"] is not None else None,
+                "value": _f(r["value"]),
+                "threshold": _f(r["threshold"]),
+                "reason": r["reason"],
+                "detected_at": r["detected_at"].isoformat()
+                if r["detected_at"] is not None
+                else None,
+            }
+            for r in rows
         ]
 
     spec = _build_window_spec(device, readings)

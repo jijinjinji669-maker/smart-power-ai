@@ -142,7 +142,9 @@ def build_prompt(data: DiagnosisInput) -> tuple[str, list[dict[str, Any]], dict[
         "- 只能从「候选签名」里选 cause_key，或选 unknown\n"
         "- reasoning 必须引用「异常区间」里的具体数值，不要泛泛而谈\n"
         "- 如果特征看起来像正常现象（例如启动浪涌），请把 is_normal_phenomenon 设为 true\n\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2)
+        # default=str 是保险：上游若漏了某个非原生类型（Decimal / datetime），
+        # 只会被转成字符串，而不是让整个诊断直接失败
+        + json.dumps(payload, ensure_ascii=False, indent=2, default=str)
     )
     return prompt, features, overall
 

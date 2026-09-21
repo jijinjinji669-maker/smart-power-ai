@@ -120,8 +120,12 @@ def main() -> int:
     done = threading.Event()
 
     def on_connect(client, userdata, flags, reason_code, properties=None):
-        if int(reason_code) != 0:
-            print(f"连接失败 rc={reason_code}", file=sys.stderr)
+        # paho-mqtt v2 的回调参数是 ReasonCode 对象，不是 int，
+        # 直接 int(reason_code) 会抛 TypeError。取 .value 才是数值。
+        rc = getattr(reason_code, "value", reason_code)
+        if rc != 0:
+            print(f"连接失败 rc={rc}（{reason_code}）", file=sys.stderr)
+            got["error"] = f"MQTT 连接失败 rc={rc}"
             done.set()
             return
         client.subscribe(result_topic, qos=1)

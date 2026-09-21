@@ -45,6 +45,8 @@ RUN useradd -m -u 1000 appuser
 
 COPY --chown=appuser:appuser app/ ./app/
 COPY --chown=appuser:appuser simulator/ ./simulator/
+# tools/ 是运维工具（手动注入故障等），要能进容器执行 python -m tools.inject
+COPY --chown=appuser:appuser tools/ ./tools/
 COPY --chown=appuser:appuser requirements.txt ./
 
 USER appuser
