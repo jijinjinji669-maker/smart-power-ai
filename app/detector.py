@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 MAD_TO_SIGMA = 1.4826  # 使 MAD 在正态分布下与标准差可比
@@ -32,16 +32,36 @@ class DetectParams:
     刻意做成不依赖 pydantic 的纯 dataclass：
     检测是纯数学逻辑，不应该因为「没装配置框架」就跑不起来，
     也方便单元测试里直接构造参数，不必先搭起整个 Settings。
+
+    关于阈值分两类，不要混：
+      · **绝对安全阈值**：漏电 30 mA、温度 55 ℃。这些是人身与设备安全线，
+        与设备容量无关，任何档位都一样。
+      · **相对电气阈值**：过载边界必须由该设备的额定电流推导。
+        用一个绝对安培值当门槛是错的 —— 照明回路 18 A 已经过载，
+        而 63 A 总开关 25 A 完全正常，同一个数字不可能对两者都对。
     """
 
     detect_window: int = 60
     detect_mad_k: float = 4.0
     detect_min_confirm: int = 2
+    # 绝对安全阈值
     leakage_limit_ma: float = 30.0
     voltage_min_v: float = 198.0
     temp_limit_c: float = 55.0
-    rated_current_a: float = 40.0
-    overload_floor_a: float = 20.0
+    # 相对电气阈值：由设备额定电流推导，不再使用固定安培值
+    rated_current_a: float = 20.0
+    # 过载判定起点：热保护保持边界 1.13 × In（IEC 60898-1）。
+    # 低于此值 1 小时内本就不应脱扣，因此连预警都不该报。
+    thermal_hold_factor: float = 1.13
+
+    @property
+    def overload_floor_a(self) -> float:
+        """过载预警起点 = 1.13 × 额定电流。"""
+        return self.thermal_hold_factor * self.rated_current_a
+
+    def with_rated_current(self, rated_current: float) -> "DetectParams":
+        """按设备额定电流派生一份参数，其余字段不变。"""
+        return replace(self, rated_current_a=rated_current)
 
     @classmethod
     def from_settings(cls, settings: Any) -> "DetectParams":
@@ -53,8 +73,8 @@ class DetectParams:
             leakage_limit_ma=settings.leakage_limit_ma,
             voltage_min_v=settings.voltage_min_v,
             temp_limit_c=settings.temp_limit_c,
-            rated_current_a=settings.rated_current_a,
-            overload_floor_a=settings.overload_floor_a,
+            rated_current_a=getattr(settings, "rated_current_a", 20.0),
+            thermal_hold_factor=getattr(settings, "thermal_hold_factor", 1.13),
         )
 
 
@@ -139,7 +159,7 @@ class AnomalyDetector:
             cur[-1], vol[-1], lek[-1], tmp[-1],
         )
 
-        # ---- 过载：统计异常 AND 超过物理下限 ----
+        # ---- 过载：统计异常 AND 超过该设备的过载起点 ----
         if (
             _confirm(_mad_flags(cur, s.detect_window, s.detect_mad_k), s.detect_min_confirm)[-1]
             and latest_cur > s.overload_floor_a
@@ -148,8 +168,9 @@ class AnomalyDetector:
             alerts.append(
                 Alert(
                     "过载", 3, latest_cur, s.overload_floor_a,
-                    f"电流 {latest_cur:.2f}A 偏离窗口中位数 {med:.2f}A 超过 "
-                    f"{s.detect_mad_k} 倍 MAD，且高于 {s.overload_floor_a}A",
+                    f"电流 {latest_cur:.1f}A 偏离窗口中位数 {med:.1f}A 超过 "
+                    f"{s.detect_mad_k} 倍 MAD，且高于该回路 {s.rated_current_a:.0f}A 额定的 "
+                    f"{s.thermal_hold_factor} 倍（{s.overload_floor_a:.1f}A）",
                 )
             )
 

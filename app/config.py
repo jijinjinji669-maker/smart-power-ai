@@ -27,16 +27,22 @@ class Settings(BaseSettings):
     batch_size: int = 500
     batch_flush_seconds: float = 2.0
 
-    # ---- 异常检测（Day 3 调参只改环境变量）----
+    # ---- 异常检测 ----
+    # 阈值分两类：
+    #   绝对安全阈值（漏电 30mA、温度 55℃）与设备容量无关，任何档位一致；
+    #   相对电气阈值（过载）必须由该设备额定电流推导 —— 见 rated_current_a
+    #   与 thermal_hold_factor，不再使用固定的安培绝对值。
     detect_window: int = 60
     detect_mad_k: float = 4.0
     detect_min_confirm: int = 2
     leakage_limit_ma: float = 30.0
     voltage_min_v: float = 198.0
     temp_limit_c: float = 55.0
-    rated_current_a: float = 40.0
-    # 统计异常还需同时越过物理线，避免把"正常爬坡"判成故障
-    overload_floor_a: float = 20.0
+    # 过载预警起点 = thermal_hold_factor × 该设备额定电流
+    # 1.13 是 IEC 60898-1 的热保护保持边界：低于此值 1 小时内本就不应脱扣
+    thermal_hold_factor: float = 1.13
+    # 默认额定电流，实际检测时会按每台设备的额定值覆盖
+    rated_current_a: float = 20.0
 
     # ---- LLM（Phase 6）----
     llm_api_key: str = ""
