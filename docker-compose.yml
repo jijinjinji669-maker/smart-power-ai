@@ -187,7 +187,11 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: always
-    command: ["python", "-m", "simulator.breaker_sim", "--devices", "10", "--interval", "5"]
+    # 20 台覆盖四个档位：4 照明 + 6 插座 + 6 空调 + 4 总开关。
+    # 设备数少于 20 时用不到空调和总开关档位，分档设计就白做了。
+    # --fault-level：realistic 对齐真实年故障率 / demo 演示 / off 纯手动注入
+    command: ["python", "-m", "simulator.breaker_sim",
+              "--devices", "20", "--interval", "5", "--fault-level", "demo"]
     environment:
       MQTT_HOST: mqtt
       MQTT_PORT: "1883"
