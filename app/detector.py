@@ -147,11 +147,20 @@ class AnomalyDetector:
             if len(buf) > cap:
                 del buf[0]
 
+    @property
+    def warm(self) -> bool:
+        """窗口是否已积累足够样本、统计检测是否可靠。
+
+        consumer 用它决定「能否判定告警恢复」：冷启动时统计量不可靠，
+        不能因为「这一帧没命中」就断言故障已消失。
+        """
+        return len(self.current) >= max(10, self.s.detect_window // 4)
+
     def detect(self) -> list[Alert]:
         s = self.s
         alerts: list[Alert] = []
         # 冷启动：窗口太短时统计量不可靠，只做物理阈值判断
-        if len(self.current) < max(10, s.detect_window // 4):
+        if not self.warm:
             return self._physical_only()
 
         cur, vol, lek, tmp = self.current, self.voltage, self.leakage, self.temperature

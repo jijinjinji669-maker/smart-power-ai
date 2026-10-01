@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS devices (
     device_sn     VARCHAR(64) UNIQUE NOT NULL,
     name          VARCHAR(128),
     location      VARCHAR(128),
-    rated_current NUMERIC(6,2)  DEFAULT 40,
+    rated_current NUMERIC(6,2),  -- 由设备上报、consumer 落库；不再用静默的 40 兜底
     rated_voltage NUMERIC(6,2)  DEFAULT 220,
     firmware      VARCHAR(32),
     last_seen_at  TIMESTAMPTZ,

@@ -21,6 +21,7 @@ import redis.asyncio as aioredis
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from app.alerttrack import plan_transitions
 from app.config import get_settings
 from app.db import SessionLocal, engine
 from app.detector import AnomalyDetector, DetectParams
@@ -51,8 +52,24 @@ INSERT_ALERT = text(
     """
     INSERT INTO alerts (device_id, alert_type, severity, value, threshold, reason, detected_at)
     VALUES (:device_id, :alert_type, :severity, :value, :threshold, :reason, :detected_at)
+    RETURNING id
     """
 )
+
+RESOLVE_ALERT = text(
+    """
+    UPDATE alerts SET resolved_at = :resolved_at WHERE id = :id
+    """
+)
+
+
+def _payload_rating(payload: dict[str, Any]) -> float | None:
+    """从上报 payload 取额定电流；缺失或非法时返回 None（由调用方回退默认值）。"""
+    try:
+        value = payload.get("rated_current")
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 class IngestPipeline:
@@ -63,34 +80,96 @@ class IngestPipeline:
         # 只在启动时从 pydantic Settings 转换一次，避免每条上报都构造一遍参数对象
         self.detect_params = DetectParams.from_settings(settings)
         self.redis: aioredis.Redis | None = None
-        self.stats = {"received": 0, "written": 0, "duplicated": 0, "alerts": 0, "bad": 0}
+        # 每台设备的额定电流（由上报 payload 落库后缓存），用于按设备派生检测阈值
+        self.device_ratings: dict[str, float] = {}
+        # 尚未恢复的告警：device_sn -> {alert_type: alert_id}，用于去重与恢复
+        self.open_alerts: dict[str, dict[str, int]] = {}
+        self.stats = {
+            "received": 0, "written": 0, "duplicated": 0,
+            "alerts": 0, "resolved": 0, "bad": 0,
+        }
 
     async def start(self) -> None:
         self.redis = aioredis.Redis(
             host=settings.redis_host, port=settings.redis_port, decode_responses=True
         )
         await self._load_devices()
+        await self._load_open_alerts()
 
     async def _load_devices(self) -> None:
         async with SessionLocal() as session:
-            rows = (await session.execute(text("SELECT device_sn, id FROM devices"))).all()
-        self.device_ids = {sn: pk for sn, pk in rows}
+            rows = (await session.execute(
+                text("SELECT device_sn, id, rated_current FROM devices")
+            )).all()
+        self.device_ids = {sn: pk for sn, pk, _ in rows}
+        self.device_ratings = {
+            sn: float(rc) if rc is not None else settings.rated_current_a
+            for sn, _, rc in rows
+        }
         log.info("已加载 %d 台设备", len(self.device_ids))
 
-    async def _ensure_device(self, session, sn: str, name: str | None) -> int:
+    async def _load_open_alerts(self) -> None:
+        """启动时把数据库里尚未恢复的告警载入内存。
+
+        这样重启后对「仍在持续」的故障不会重复开新告警；若故障其实已恢复，
+        也会在下一帧检测到「该类型不再命中」时被正常关闭。
+        """
+        async with SessionLocal() as session:
+            rows = (await session.execute(
+                text(
+                    "SELECT d.device_sn, a.alert_type, a.id "
+                    "FROM alerts a JOIN devices d ON d.id = a.device_id "
+                    "WHERE a.resolved_at IS NULL"
+                )
+            )).all()
+        for sn, alert_type, alert_id in rows:
+            self.open_alerts.setdefault(sn, {})[alert_type] = alert_id
+        log.info("已加载 %d 条未恢复告警", len(rows))
+
+    async def _ensure_device(
+        self, session, sn: str, name: str | None, rated_current: float | None
+    ) -> int:
+        """确保设备已落库并缓存其额定电流。
+
+        额定电流以设备上报为准；缺省时回退到配置默认值。
+        若同一设备上报的额定电流与缓存不一致（例如旧数据落库成了 40），
+        就顺带纠正数据库与缓存 —— 这是一次性自愈，不会每条消息都写库。
+        """
         if sn in self.device_ids:
+            cached = self.device_ratings.get(sn)
+            if (
+                rated_current is not None
+                and cached is not None
+                and abs(cached - rated_current) > 1e-6
+            ):
+                await session.execute(
+                    text("UPDATE devices SET rated_current = :r WHERE device_sn = :sn"),
+                    {"r": rated_current, "sn": sn},
+                )
+                self.device_ratings[sn] = rated_current
+                self.detectors.pop(sn, None)  # 用新额定值重建检测器
             return self.device_ids[sn]
+
+        rating = rated_current if rated_current is not None else settings.rated_current_a
         result = await session.execute(
             text(
-                "INSERT INTO devices (device_sn, name) VALUES (:sn, :name) "
-                "ON CONFLICT (device_sn) DO UPDATE SET name = EXCLUDED.name RETURNING id"
+                "INSERT INTO devices (device_sn, name, rated_current) "
+                "VALUES (:sn, :name, :rated) "
+                "ON CONFLICT (device_sn) DO UPDATE SET "
+                "name = EXCLUDED.name, rated_current = EXCLUDED.rated_current "
+                "RETURNING id, rated_current"
             ),
-            {"sn": sn, "name": name or sn},
+            {"sn": sn, "name": name or sn, "rated": rating},
         )
-        device_id = result.scalar_one()
+        row = result.mappings().one()
+        device_id = row["id"]
         self.device_ids[sn] = device_id
-        self.detectors[sn] = AnomalyDetector(self.detect_params)
-        log.info("发现新设备 %s -> id=%s", sn, device_id)
+        self.device_ratings[sn] = (
+            float(row["rated_current"]) if row["rated_current"] is not None else rating
+        )
+        log.info(
+            "发现新设备 %s -> id=%s rated=%.1fA", sn, device_id, self.device_ratings[sn]
+        )
         return device_id
 
     async def put(self, payload: dict[str, Any]) -> None:
@@ -123,14 +202,19 @@ class IngestPipeline:
             last_flush = asyncio.get_running_loop().time()
 
     async def _flush(self, batch: list[dict[str, Any]]) -> None:
-        rows, alerts = [], []
+        rows = []
+        n_opened = 0
+        n_resolved = 0
         try:
             async with SessionLocal() as session:
                 for payload in batch:
                     try:
                         sn = payload["device_sn"]
                         recorded_at = datetime.fromisoformat(payload["recorded_at"])
-                        device_id = await self._ensure_device(session, sn, payload.get("name"))
+                        rating = _payload_rating(payload)
+                        device_id = await self._ensure_device(
+                            session, sn, payload.get("name"), rating
+                        )
                     except (KeyError, ValueError) as exc:
                         self.stats["bad"] += 1
                         log.warning("字段异常，跳过：%s", exc)
@@ -152,36 +236,66 @@ class IngestPipeline:
                         }
                     )
 
-                    detector = self.detectors.setdefault(sn, AnomalyDetector(self.detect_params))
+                    # 按该设备额定电流派生检测参数，而不是用全局 20A
+                    rating = self.device_ratings.get(sn, settings.rated_current_a)
+                    detector = self.detectors.setdefault(
+                        sn, AnomalyDetector(self.detect_params.with_rated_current(rating))
+                    )
                     detector.push(
                         float(payload.get("current") or 0.0),
                         float(payload.get("voltage") or 0.0),
                         float(payload.get("leakage") or 0.0),
                         float(payload.get("temperature") or 0.0),
                     )
-                    for alert in detector.detect():
-                        alerts.append(
-                            {
-                                "device_id": device_id,
-                                "alert_type": alert.alert_type,
-                                "severity": alert.severity,
-                                "value": alert.value,
-                                "threshold": alert.threshold,
-                                "reason": alert.reason,
-                                "detected_at": recorded_at,
-                            }
+
+                    detected = detector.detect()
+                    by_type = {a.alert_type: a for a in detected}
+                    open_for_sn = self.open_alerts.setdefault(sn, {})
+                    to_open, to_resolve = plan_transitions(
+                        set(open_for_sn), set(by_type), detector.warm
+                    )
+
+                    # 1) 新开告警（去重：同类型未恢复前只插一条）
+                    for alert_type in to_open:
+                        alert = by_type[alert_type]
+                        alert_id = (
+                            await session.execute(
+                                INSERT_ALERT,
+                                {
+                                    "device_id": device_id,
+                                    "alert_type": alert.alert_type,
+                                    "severity": alert.severity,
+                                    "value": alert.value,
+                                    "threshold": alert.threshold,
+                                    "reason": alert.reason,
+                                    "detected_at": recorded_at,
+                                },
+                            )
+                        ).scalar_one()
+                        open_for_sn[alert_type] = alert_id
+                        n_opened += 1
+
+                    # 2) 恢复（关闭）告警：仅窗口足够（统计可靠）时判定
+                    for alert_type in to_resolve:
+                        await session.execute(
+                            RESOLVE_ALERT,
+                            {"id": open_for_sn[alert_type], "resolved_at": recorded_at},
                         )
+                        del open_for_sn[alert_type]
+                        n_resolved += 1
 
                 if rows:
                     await session.execute(INSERT_READINGS, rows)
-                if alerts:
-                    await session.execute(INSERT_ALERT, alerts)
                 await session.commit()
 
                 self.stats["written"] += len(rows)
-                self.stats["alerts"] += len(alerts)
-                if alerts:
-                    log.warning("写入 %d 条读数，产生 %d 条告警", len(rows), len(alerts))
+                self.stats["alerts"] += n_opened
+                self.stats["resolved"] += n_resolved
+                if n_opened or n_resolved:
+                    log.warning(
+                        "写入 %d 条读数，开 %d 条告警，恢复 %d 条",
+                        len(rows), n_opened, n_resolved,
+                    )
                 else:
                     log.info("写入 %d 条读数", len(rows))
         except Exception:
@@ -206,7 +320,7 @@ class IngestPipeline:
         s = self.stats
         return (
             f"收到 {s['received']} / 入库 {s['written']} / 告警 {s['alerts']} / "
-            f"脏数据 {s['bad']} / 队列 {self.queue.qsize()}"
+            f"恢复 {s['resolved']} / 脏数据 {s['bad']} / 队列 {self.queue.qsize()}"
         )
 
 
